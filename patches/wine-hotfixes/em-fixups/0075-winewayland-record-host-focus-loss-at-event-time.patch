@@ -1,0 +1,109 @@
+From: GE-Proton <noreply@localhost>
+Subject: [PATCH] winewayland: record host focus loss at event time
+
+WM_WINE_WINDOW_STATE_CHANGED carries no state, so WAYLAND_GetWindowStateUpdates()
+re-derived the focus loss from keyboard->focused_hwnd when the posted message was
+finally handled. Whether a leave deactivated the window therefore depended on
+whether a later enter had already been dispatched. Changing timing (for example
+WINEDEBUG=+waylanddrv) changes that ordering and can make focus handling appear
+to work; the old path is a race, not a fix.
+
+Record the focus loss in the leave callback, while it is still the latest host
+event, and let the state handler consume that record. An enter clears it, so the
+result now follows event order instead of message delivery order. Apply the
+queued record before the WS_VISIBLE/WS_CHILD/WS_DISABLED early returns, matching
+the existing queued state and geometry updates.
+
+WAYLANDDRV_FOCUS_LOSS=0 keeps its current behavior: no focus loss is recorded.
+---
+diff --git a/dlls/winewayland.drv/wayland_keyboard.c b/dlls/winewayland.drv/wayland_keyboard.c
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -983,6 +983,9 @@
+ 
+     pthread_mutex_lock(&keyboard->mutex);
+     keyboard->focused_hwnd = hwnd;
++    /* The host has keyboard focus again, so a leave that was recorded but not
++     * delivered yet must not deactivate the window when its message is handled. */
++    keyboard->host_focus_lost_hwnd = NULL;
+     pthread_mutex_unlock(&keyboard->mutex);
+ 
+     NtUserPostMessage(hwnd, WM_INPUTLANGCHANGEREQUEST, 0 /*FIXME*/, (LPARAM)keyboard_hkl);
+@@ -1050,10 +1053,16 @@
+             send_message(hwnd, WM_CANCELMODE, 0, 0);
+     }
+ 
+-    if (hwnd == foreground)
++    if (hwnd == foreground && !wayland_disable_focus_loss())
+     {
+-        if (!wayland_disable_focus_loss())
+-            NtUserPostMessage(hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0);
++        /* Record the focus loss here, while it is still the latest host event.
++         * The window-state handler must not re-derive it from keyboard->focused_hwnd,
++         * which may already belong to a later enter when the message is handled. */
++        pthread_mutex_lock(&keyboard->mutex);
++        keyboard->host_focus_lost_hwnd = hwnd;
++        pthread_mutex_unlock(&keyboard->mutex);
++
++        NtUserPostMessage(hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0);
+     }
+ }
+ 
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -130,6 +130,10 @@
+     struct xkb_context *xkb_context;
+     struct xkb_state *xkb_state;
+     HWND focused_hwnd;
++    /* Last foreground window that lost host keyboard focus, recorded when the
++     * leave event is dispatched. Consumed by the window-state handler so the
++     * focus loss does not depend on message delivery order. */
++    HWND host_focus_lost_hwnd;
+     pthread_mutex_t mutex;
+     /* scancode -> keystate mapping. The keyboard state is the same across every instance of a seat.
+      * We bind to the first seat each time, and this first bind seat should be the same every time. */
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1692,7 +1692,7 @@
+     struct wayland_win_data *data;
+     DWORD style;
+     HWND focused_hwnd, old_foreground;
+-    BOOL ret, host_minimize_supported = TRUE;
++    BOOL ret, host_minimize_supported = TRUE, host_focus_lost;
+ 
+     /* win32u uses a second call with NULL outputs to release any host state
+      * lock acquired by the first call. Wine-Wayland does not acquire one. */
+@@ -1724,15 +1724,27 @@
+ 
+     wayland_win_data_release(data);
+ 
++    pthread_mutex_lock(&keyboard->mutex);
++    focused_hwnd = keyboard->focused_hwnd;
++    host_focus_lost = keyboard->host_focus_lost_hwnd == hwnd;
++    if (host_focus_lost) keyboard->host_focus_lost_hwnd = NULL;
++    pthread_mutex_unlock(&keyboard->mutex);
++
++    /* A leave recorded at event time must deactivate this window even if the
++     * live keyboard state already belongs to a later enter. Re-deriving the
++     * focus loss from focused_hwnd here made the result depend on message
++     * delivery order, and therefore on WINEDEBUG timing. */
++    if (host_focus_lost && !*foreground)
++    {
++        *foreground = NtUserGetDesktopWindow();
++        ret = TRUE;
++    }
++
+     /* in these cases we dont need to update the window focus, borrowed from winemac */
+     if (!(style & WS_VISIBLE)) return ret;
+     if ((style & (WS_POPUP | WS_CHILD)) == WS_CHILD) return ret;
+     if (style & WS_DISABLED) return ret;
+ 
+-    pthread_mutex_lock(&keyboard->mutex);
+-    focused_hwnd = keyboard->focused_hwnd;
+-    pthread_mutex_unlock(&keyboard->mutex);
+-
+     /* if the foreground window is not the hwnd then this is a stale focus loss */
+     if (!focused_hwnd && old_foreground == hwnd)
+         focused_hwnd = NtUserGetDesktopWindow();
