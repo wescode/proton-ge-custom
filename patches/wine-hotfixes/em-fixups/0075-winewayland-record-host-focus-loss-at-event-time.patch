@@ -4,15 +4,30 @@ Subject: [PATCH] winewayland: record host focus loss at event time
 WM_WINE_WINDOW_STATE_CHANGED carries no state, so WAYLAND_GetWindowStateUpdates()
 re-derived the focus loss from keyboard->focused_hwnd when the posted message was
 finally handled. Whether a leave deactivated the window therefore depended on
-whether a later enter had already been dispatched. Changing timing (for example
+whether a later enter had already been dispatched, and on whether Wine's
+foreground window happened to be up to date. Changing timing (for example
 WINEDEBUG=+waylanddrv) changes that ordering and can make focus handling appear
 to work; the old path is a race, not a fix.
 
 Record the focus loss in the leave callback, while it is still the latest host
 event, and let the state handler consume that record. An enter clears it, so the
-result now follows event order instead of message delivery order. Apply the
-queued record before the WS_VISIBLE/WS_CHILD/WS_DISABLED early returns, matching
-the existing queued state and geometry updates.
+result follows event order instead of message delivery order. Apply the queued
+record before the WS_VISIBLE/WS_CHILD/WS_DISABLED early returns, matching the
+existing queued state and geometry updates.
+
+Also record the loss when the leaving surface held Wine keyboard focus even if it
+is not the current foreground window. Wine's foreground update is itself driven
+by a queued enter message, and popups hold host keyboard focus without ever
+becoming foreground. A leave is ignored while another Wine surface already holds
+host focus, so opening a menu or moving between the application's own windows
+still does not deactivate it, and layer menus remain excluded.
+
+Deactivate by clearing the thread's active window with NtUserSetActiveWindow(0)
+instead of returning NtUserGetDesktopWindow(). The desktop window is created
+detached from any thread, so the server rejects it in make_window_foreground()
+and the foreground update silently fails. Clearing the active window delivers the
+same WM_ACTIVATE/WM_KILLFOCUS/WM_ACTIVATEAPP messages and makes
+NtUserGetForegroundWindow() return NULL.
 
 WAYLANDDRV_FOCUS_LOSS=0 keeps its current behavior: no focus loss is recorded.
 ---
@@ -29,12 +44,50 @@ diff --git a/dlls/winewayland.drv/wayland_keyboard.c b/dlls/winewayland.drv/wayl
      pthread_mutex_unlock(&keyboard->mutex);
  
      NtUserPostMessage(hwnd, WM_INPUTLANGCHANGEREQUEST, 0 /*FIXME*/, (LPARAM)keyboard_hkl);
-@@ -1050,10 +1053,16 @@
+@@ -1022,6 +1025,7 @@
+ {
+     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
+     HWND foreground, hwnd;
++    BOOL was_focused, layer_menu, other_focused;
+ 
+     InterlockedExchange(&process_wayland.input_serial, serial);
+ 
+@@ -1033,8 +1037,12 @@
+     TRACE("serial=%u hwnd=%p\n", serial, hwnd);
+ 
+     pthread_mutex_lock(&keyboard->mutex);
+-    if (keyboard->focused_hwnd == hwnd)
++    was_focused = keyboard->focused_hwnd == hwnd;
++    if (was_focused)
+         keyboard->focused_hwnd = NULL;
++    /* Another Wine surface may already hold host focus (for example a menu
++     * popup, if the compositor sent its enter before this leave). */
++    other_focused = keyboard->focused_hwnd != NULL;
+     pthread_mutex_unlock(&keyboard->mutex);
+ 
+     /* The spec for the leave event tells us to treat all keys as released,
+@@ -1042,7 +1050,8 @@
+     release_all_keys(hwnd);
+ 
+     foreground = NtUserGetForegroundWindow();
+-    if (wayland_is_layer_menu_hwnd(hwnd))
++    layer_menu = wayland_is_layer_menu_hwnd(hwnd);
++    if (layer_menu)
+         wayland_cancel_layer_menu(hwnd);
+     else if (hwnd == foreground || wayland_is_menu_popup(hwnd))
+     {
+@@ -1050,10 +1059,22 @@
              send_message(hwnd, WM_CANCELMODE, 0, 0);
      }
  
 -    if (hwnd == foreground)
-+    if (hwnd == foreground && !wayland_disable_focus_loss())
++    /* Wine's foreground window can lag behind the host (its enter message may
++     * still be queued), and a popup can hold host keyboard focus without ever
++     * becoming the foreground window. Record the loss whenever this surface
++     * held Wine keyboard focus, but not while another Wine surface already holds
++     * it, and never for layer menus, which must not deactivate the application. */
++    if (!layer_menu && (was_focused || (hwnd == foreground && !other_focused)) &&
++        !wayland_disable_focus_loss())
      {
 -        if (!wayland_disable_focus_loss())
 -            NtUserPostMessage(hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0);
@@ -75,7 +128,7 @@ diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
  
      /* win32u uses a second call with NULL outputs to release any host state
       * lock acquired by the first call. Wine-Wayland does not acquire one. */
-@@ -1724,15 +1724,27 @@
+@@ -1724,21 +1724,43 @@
  
      wayland_win_data_release(data);
  
@@ -88,10 +141,16 @@ diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
 +    /* A leave recorded at event time must deactivate this window even if the
 +     * live keyboard state already belongs to a later enter. Re-deriving the
 +     * focus loss from focused_hwnd here made the result depend on message
-+     * delivery order, and therefore on WINEDEBUG timing. */
-+    if (host_focus_lost && !*foreground)
++     * delivery order, and therefore on WINEDEBUG timing.
++     *
++     * The desktop window is created detached from any thread and the server
++     * rejects it as a foreground target, so return no foreground HWND and
++     * clear this thread's active window instead. set_active_window() then
++     * delivers WM_ACTIVATE(WA_INACTIVE), WM_KILLFOCUS and WM_ACTIVATEAPP(FALSE),
++     * and NtUserGetForegroundWindow() starts returning NULL. */
++    if (host_focus_lost)
 +    {
-+        *foreground = NtUserGetDesktopWindow();
++        NtUserSetActiveWindow( 0 );
 +        ret = TRUE;
 +    }
 +
@@ -106,4 +165,16 @@ diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
 -
      /* if the foreground window is not the hwnd then this is a stale focus loss */
      if (!focused_hwnd && old_foreground == hwnd)
-         focused_hwnd = NtUserGetDesktopWindow();
+-        focused_hwnd = NtUserGetDesktopWindow();
++    {
++        if (!host_focus_lost) NtUserSetActiveWindow( 0 );
++        focused_hwnd = NULL;
++    }
+     else if (focused_hwnd != hwnd) focused_hwnd = NULL;
+ 
+-    if (!*foreground && old_foreground != focused_hwnd) *foreground = focused_hwnd;
++    if (!host_focus_lost && !*foreground && focused_hwnd && old_foreground != focused_hwnd)
++        *foreground = focused_hwnd;
+ 
+     /* we can't track if the host window is minimized or unminimized, but
+      * if we have keyboard focus on this window we can treat it as restored.
